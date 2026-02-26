@@ -1,0 +1,10 @@
+mani-skill>=3.0.0
+torch>=2.0.0
+torchvision
+diffusers
+einops
+tyro
+tensorboard
+h5py
+opencv-python
+tqdm
