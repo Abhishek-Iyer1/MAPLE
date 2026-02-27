@@ -1,4 +1,4 @@
-mani-skill>=3.0.0
+mani-skill>=3.0.0b20
 torch>=2.0.0
 torchvision
 diffusers

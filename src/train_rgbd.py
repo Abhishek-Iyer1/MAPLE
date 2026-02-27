@@ -2,6 +2,7 @@ ALGO_NAME = "BC_Diffusion_rgbd_UNet"
 
 import os
 import random
+import h5py
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -121,90 +122,73 @@ def reorder_keys(d, ref_dict):
     return out
 
 
-class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
+class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load to CPU, batch to GPU
     def __init__(self, data_path, obs_process_fn, obs_space, include_rgb, include_depth, device, num_traj):
         self.include_rgb = include_rgb
         self.include_depth = include_depth
+        self.device = device  # Store device for later batch transfer
+        
         from diffusion_policy.utils import load_demo_dataset
         trajectories = load_demo_dataset(data_path, num_traj=num_traj, concat=False)
-        # trajectories['observations'] is a list of dict, each dict is a traj, with keys in obs_space, values with length L+1
-        # trajectories['actions'] is a list of np.ndarray (L, act_dim)
         print("Raw trajectory loaded, beginning observation pre-processing...")
 
-        # Pre-process the observations, make them align with the obs returned by the obs_wrapper
+        # Pre-process observations - KEEP ON CPU
         obs_traj_dict_list = []
         for obs_traj_dict in trajectories["observations"]:
-            _obs_traj_dict = reorder_keys(
-                obs_traj_dict, obs_space
-            )  # key order in demo is different from key order in env obs
+            _obs_traj_dict = reorder_keys(obs_traj_dict, obs_space)
             _obs_traj_dict = obs_process_fn(_obs_traj_dict)
+            
+            # Convert to tensors but KEEP ON CPU
             if self.include_depth:
-                _obs_traj_dict["depth"] = torch.Tensor(
+                _obs_traj_dict["depth"] = torch.from_numpy(
                     _obs_traj_dict["depth"].astype(np.float32)
-                ).to(device=device, dtype=torch.float16)
+                ).to(dtype=torch.float16)  # CPU, float16 to save memory
             if self.include_rgb:
-                _obs_traj_dict["rgb"] = torch.from_numpy(_obs_traj_dict["rgb"]).to(
-                    device
-                )  # still uint8
-            _obs_traj_dict["state"] = torch.from_numpy(_obs_traj_dict["state"]).to(
-                device
-            )
+                _obs_traj_dict["rgb"] = torch.from_numpy(_obs_traj_dict["rgb"])  # CPU, uint8
+            _obs_traj_dict["state"] = torch.from_numpy(_obs_traj_dict["state"]).float()  # CPU
+            
             obs_traj_dict_list.append(_obs_traj_dict)
+        
         trajectories["observations"] = obs_traj_dict_list
         self.obs_keys = list(_obs_traj_dict.keys())
-        # Pre-process the actions
+        
+        # Pre-process actions - KEEP ON CPU
         for i in range(len(trajectories["actions"])):
-            trajectories["actions"][i] = torch.Tensor(trajectories["actions"][i]).to(
-                device=device
-            )
-        print(
-            "Obs/action pre-processing is done, start to pre-compute the slice indices..."
-        )
+            trajectories["actions"][i] = torch.from_numpy(
+                trajectories["actions"][i]
+            ).float()  # CPU
+        
+        print("Obs/action pre-processing is done, start to pre-compute the slice indices...")
 
-        # Pre-compute all possible (traj_idx, start, end) tuples, this is very specific to Diffusion Policy
-        if (
-            "delta_pos" in args.control_mode
-            or args.control_mode == "base_pd_joint_vel_arm_pd_joint_vel"
-        ):
-            print("Detected a delta controller type, padding with a zero action to ensure the arm stays still after solving tasks.")
-            self.pad_action_arm = torch.zeros(
-                (trajectories["actions"][0].shape[1] - 1,), device=device
-            )
-            # to make the arm stay still, we pad the action with 0 in 'delta_pos' control mode
-            # gripper action needs to be copied from the last action
+        # Padding setup
+        if "delta_pos" in args.control_mode or args.control_mode == "base_pd_joint_vel_arm_pd_joint_vel":
+            print("Detected a delta controller type, padding with zero action.")
+            self.pad_action_arm = torch.zeros((trajectories["actions"][0].shape[1] - 1,))  # CPU
         else:
-            # NOTE for absolute joint pos control probably should pad with the final joint position action.
             raise NotImplementedError(f"Control Mode {args.control_mode} not supported")
-        self.obs_horizon, self.pred_horizon = obs_horizon, pred_horizon = (
-            args.obs_horizon,
-            args.pred_horizon,
-        )
+        
+        self.obs_horizon = args.obs_horizon
+        self.pred_horizon = args.pred_horizon
+        obs_horizon, pred_horizon = args.obs_horizon, args.pred_horizon
+        
+        # Pre-compute slices
         self.slices = []
-        num_traj = len(trajectories["actions"])
         total_transitions = 0
+        num_traj = len(trajectories["actions"])
+        
         for traj_idx in range(num_traj):
             L = trajectories["actions"][traj_idx].shape[0]
             assert trajectories["observations"][traj_idx]["state"].shape[0] == L + 1
             total_transitions += L
 
-            # |o|o|                             observations: 2
-            # | |a|a|a|a|a|a|a|a|               actions executed: 8
-            # |p|p|p|p|p|p|p|p|p|p|p|p|p|p|p|p| actions predicted: 16
             pad_before = obs_horizon - 1
-            # Pad before the trajectory, so the first action of an episode is in "actions executed"
-            # obs_horizon - 1 is the number of "not used actions"
             pad_after = pred_horizon - obs_horizon
-            # Pad after the trajectory, so all the observations are utilized in training
-            # Note that in the original code, pad_after = act_horizon - 1, but I think this is not the best choice
             self.slices += [
                 (traj_idx, start, start + pred_horizon)
                 for start in range(-pad_before, L - pred_horizon + pad_after)
-            ]  # slice indices follow convention [start, end)
+            ]
 
-        print(
-            f"Total transitions: {total_transitions}, Total obs sequences: {len(self.slices)}"
-        )
-
+        print(f"Total transitions: {total_transitions}, Total obs sequences: {len(self.slices)}")
         self.trajectories = trajectories
 
     def __getitem__(self, index):
@@ -213,27 +197,24 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
 
         obs_traj = self.trajectories["observations"][traj_idx]
         obs_seq = {}
+        
         for k, v in obs_traj.items():
-            obs_seq[k] = v[
-                max(0, start) : start + self.obs_horizon
-            ]  # start+self.obs_horizon is at least 1
-            if start < 0:  # pad before the trajectory
+            obs_seq[k] = v[max(0, start) : start + self.obs_horizon]
+            if start < 0:
                 pad_obs_seq = torch.stack([obs_seq[k][0]] * abs(start), dim=0)
                 obs_seq[k] = torch.cat((pad_obs_seq, obs_seq[k]), dim=0)
-            # don't need to pad obs after the trajectory, see the above char drawing
 
         act_seq = self.trajectories["actions"][traj_idx][max(0, start) : end]
-        if start < 0:  # pad before the trajectory
+        if start < 0:
             act_seq = torch.cat([act_seq[0].repeat(-start, 1), act_seq], dim=0)
-        if end > L:  # pad after the trajectory
-            gripper_action = act_seq[-1, -1]  # assume gripper is with pos controller
+        if end > L:
+            gripper_action = act_seq[-1, -1]
             pad_action = torch.cat((self.pad_action_arm, gripper_action[None]), dim=0)
             act_seq = torch.cat([act_seq, pad_action.repeat(end - L, 1)], dim=0)
-            # making the robot (arm and gripper) stay still
-        assert (
-            obs_seq["state"].shape[0] == self.obs_horizon
-            and act_seq.shape[0] == self.pred_horizon
-        )
+
+        assert obs_seq["state"].shape[0] == self.obs_horizon and act_seq.shape[0] == self.pred_horizon
+        
+        # Return CPU tensors - will be moved to GPU in training loop
         return {
             "observations": obs_seq,
             "actions": act_seq,
@@ -242,7 +223,174 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
     def __len__(self):
         return len(self.slices)
 
+class LazyDemoDataset(Dataset):
+    """Load trajectories from disk on-demand."""
+    
+    def __init__(self, data_path, obs_process_fn, obs_space, include_rgb, include_depth, device, num_traj=None):
+        self.data_path = data_path
+        self.obs_process_fn = obs_process_fn
+        self.obs_space = obs_space
+        self.include_rgb = include_rgb
+        self.include_depth = include_depth
+        self.device = device
+        
+        self.obs_horizon = args.obs_horizon
+        self.pred_horizon = args.pred_horizon
+        
+        # Only read metadata, not actual data
+        with h5py.File(data_path, 'r') as f:
+            traj_keys = sorted(
+                [k for k in f.keys() if k.startswith('traj')],
+                key=lambda x: int(x.split('_')[1])
+            )
+            if num_traj:
+                traj_keys = traj_keys[:num_traj]
+            
+            # Store trajectory lengths and find camera names
+            self.traj_lengths = []
+            self.camera_names = []
+            
+            for i, k in enumerate(traj_keys):
+                L = f[k]['actions'].shape[0]
+                self.traj_lengths.append(L)
+                
+                # Get camera names from first trajectory
+                if i == 0:
+                    sensor_data = f[k]['obs/sensor_data']
+                    self.camera_names = list(sensor_data.keys())
+                    print(f"Found cameras: {self.camera_names}")
+        
+        self.traj_keys = traj_keys
+        self.num_traj = len(traj_keys)
+        
+        # Pre-compute slices
+        self.slices = []
+        obs_horizon, pred_horizon = self.obs_horizon, self.pred_horizon
+        
+        for traj_idx, L in enumerate(self.traj_lengths):
+            pad_before = obs_horizon - 1
+            pad_after = pred_horizon - obs_horizon
+            self.slices += [
+                (traj_idx, start, start + pred_horizon)
+                for start in range(-pad_before, L - pred_horizon + pad_after)
+            ]
+        
+        # Padding for delta control
+        if "delta_pos" in args.control_mode or args.control_mode == "base_pd_joint_vel_arm_pd_joint_vel":
+            with h5py.File(data_path, 'r') as f:
+                act_dim = f[traj_keys[0]]['actions'].shape[1]
+            self.pad_action_arm = torch.zeros((act_dim - 1,))
+        else:
+            raise NotImplementedError(f"Control Mode {args.control_mode} not supported")
+        
+        print(f"LazyDataset: {self.num_traj} trajectories, {len(self.slices)} slices")
+        
+        # Cache for recently accessed trajectories
+        self._cache = {}
+        self._cache_size = 10
+    
+    def _load_trajectory(self, traj_idx):
+        """Load a single trajectory from disk in the format expected by obs_process_fn."""
+        if traj_idx in self._cache:
+            return self._cache[traj_idx]
+        
+        with h5py.File(self.data_path, 'r') as f:
+            traj = f[self.traj_keys[traj_idx]]
+            
+            # Build observation dict in the same structure as env observations
+            # This matches what convert_obs expects: obs['sensor_data'][camera_name]['rgb'/'depth']
+            sensor_data = {}
+            for cam_name in self.camera_names:
+                sensor_data[cam_name] = {}
+                if self.include_rgb:
+                    sensor_data[cam_name]['rgb'] = traj[f'obs/sensor_data/{cam_name}/rgb'][:]
+                if self.include_depth:
+                    sensor_data[cam_name]['depth'] = traj[f'obs/sensor_data/{cam_name}/depth'][:]
+            
+            # Build agent observation
+            agent_obs = {
+                'qpos': traj['obs/agent/qpos'][:],
+                'qvel': traj['obs/agent/qvel'][:],
+            }
+            
+            # Build extra observation
+            extra_obs = {}
 
+            for key in traj["obs"]["extra"].keys():
+                extra_obs[key] = traj['obs/extra'][key][:]
+            
+            # Build full observation dict matching env structure
+            obs_dict = {
+                'sensor_data': sensor_data,
+                'agent': agent_obs,
+                'extra': extra_obs,
+            }
+            
+            # Load actions
+            actions = traj['actions'][:]
+        
+        # Process observations using the same function as training
+        processed_obs = self.obs_process_fn(obs_dict)
+        
+        # Convert to tensors (CPU)
+        processed = {
+            'observations': {
+                'state': torch.from_numpy(processed_obs['state']).float(),
+            },
+            'actions': torch.from_numpy(actions).float(),
+        }
+        if self.include_rgb:
+            processed['observations']['rgb'] = torch.from_numpy(processed_obs['rgb'])
+        if self.include_depth:
+            processed['observations']['depth'] = torch.from_numpy(
+                processed_obs['depth'].astype(np.float32)
+            ).to(torch.float16)
+        
+        # Update cache (LRU-style)
+        if len(self._cache) >= self._cache_size:
+            # Remove oldest entry
+            oldest_key = next(iter(self._cache))
+            del self._cache[oldest_key]
+        self._cache[traj_idx] = processed
+        
+        return processed
+    
+    def __getitem__(self, index):
+        traj_idx, start, end = self.slices[index]
+        traj_data = self._load_trajectory(traj_idx)
+        
+        obs_traj = traj_data['observations']
+        actions = traj_data['actions']
+        L = actions.shape[0]
+        
+        # Extract observation sequence
+        obs_seq = {}
+        for k, v in obs_traj.items():
+            obs_seq[k] = v[max(0, start) : start + self.obs_horizon]
+            if start < 0:
+                pad_obs_seq = torch.stack([obs_seq[k][0]] * abs(start), dim=0)
+                obs_seq[k] = torch.cat((pad_obs_seq, obs_seq[k]), dim=0)
+        
+        # Extract action sequence
+        act_seq = actions[max(0, start) : end]
+        if start < 0:
+            act_seq = torch.cat([act_seq[0].repeat(-start, 1), act_seq], dim=0)
+        if end > L:
+            gripper_action = act_seq[-1, -1]
+            pad_action = torch.cat((self.pad_action_arm, gripper_action[None]), dim=0)
+            act_seq = torch.cat([act_seq, pad_action.unsqueeze(0).repeat(end - L, 1)], dim=0)
+        
+        assert obs_seq["state"].shape[0] == self.obs_horizon
+        assert act_seq.shape[0] == self.pred_horizon
+        
+        return {
+            "observations": obs_seq,
+            "actions": act_seq,
+        }
+    
+    def __len__(self):
+        return len(self.slices)
+        
 class Agent(nn.Module):
     def __init__(self, env: VectorEnv, args: Args):
         super().__init__()
@@ -459,8 +607,8 @@ if __name__ == "__main__":
             config=config,
             name=run_name,
             save_code=True,
-            group="DiffusionPolicy",
-            tags=["diffusion_policy"],
+            group="DiffusionPolicy-Baselines",
+            tags=["diffusion_policy", "baseline-1cam", "panda", "pick-cube", "rgbd"],
         )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
@@ -487,14 +635,14 @@ if __name__ == "__main__":
     include_depth = tmp_env.unwrapped.obs_mode_struct.visual.depth
     tmp_env.close()
 
-    dataset = SmallDemoDataset_DiffusionPolicy(
+    dataset = LazyDemoDataset(
         data_path=args.demo_path,
         obs_process_fn=obs_process_fn,
         obs_space=orignal_obs_space,
         include_rgb=include_rgb,
         include_depth=include_depth,
-        device=device,
-        num_traj=args.num_demos
+        num_traj=args.num_demos,
+        device=device
     )
     sampler = RandomSampler(dataset, replacement=False)
     batch_sampler = BatchSampler(sampler, batch_size=args.batch_size, drop_last=True)
@@ -506,6 +654,12 @@ if __name__ == "__main__":
         worker_init_fn=lambda worker_id: worker_init_fn(worker_id, base_seed=args.seed),
         persistent_workers=(args.num_dataload_workers > 0),
     )
+
+    with h5py.File(args.demo_path, 'r') as f:
+        traj_keys = [k for k in f.keys() if k.startswith('traj')]
+        demo_cameras = list(f[traj_keys[0]]['obs/sensor_data'].keys())
+        
+    print(f"Demo has cameras: {demo_cameras}")
 
     agent = Agent(envs, args).to(device)
 
@@ -572,11 +726,15 @@ if __name__ == "__main__":
     for iteration, data_batch in enumerate(train_dataloader):
         timings["data_loading"] += time.time() - last_tick
 
+        # Move batch to GPU
+        obs_batch = {k: v.to(device) for k, v in data_batch["observations"].items()}
+        action_batch = data_batch["actions"].to(device)
+
         # forward and compute loss
         last_tick = time.time()
         total_loss = agent.compute_loss(
-            obs_seq=data_batch["observations"],  # obs_batch_dict['state'] is (B, L, obs_dim)
-            action_seq=data_batch["actions"],  # (B, L, act_dim)
+            obs_seq=obs_batch,  # obs_batch_dict['state'] is (B, L, obs_dim)
+            action_seq=action_batch,  # (B, L, act_dim)
         )
         timings["forward"] += time.time() - last_tick
 
