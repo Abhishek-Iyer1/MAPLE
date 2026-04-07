@@ -4,6 +4,10 @@ import torch
 from tqdm import tqdm
 from mani_skill.utils import common
 
+import json
+from tqdm import tqdm
+from mani_skill.utils.structs.pose import Pose
+
 def evaluate(n: int, agent, eval_envs, device, sim_backend: str, progress_bar: bool = True):
     agent.eval()
     if progress_bar:

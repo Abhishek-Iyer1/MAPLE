@@ -21,11 +21,16 @@ checkpoints/
 demos/
 runs/
 videos/
+eval_videos/
+debug_videos/
+log/
+logs/
 wandb/
 *.h5
 *.mp4
 *.pt
 *.ckpt
+*.log
 
 # Keep dirs but ignore contents
 !checkpoints/.gitkeep
