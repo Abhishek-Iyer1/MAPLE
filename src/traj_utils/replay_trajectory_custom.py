@@ -8,7 +8,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Register custom environments BEFORE importing ManiSkill replay
-from src.envs.pick_cube_side import PickCubeSideViewEnv
+from src.envs.pick_cube_side import PickCubeSideViewEnv, PickCubeSideViewEnvLeft, PickCubeSideViewEnvRight
+
 
 # Now import and run ManiSkill's replay_trajectory
 from mani_skill.trajectory.replay_trajectory import main, parse_args

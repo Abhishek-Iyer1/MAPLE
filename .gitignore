@@ -38,3 +38,7 @@ wandb/
 
 # OS
 .DS_Store
+
+# Reseaech Log
+src/research.md
+

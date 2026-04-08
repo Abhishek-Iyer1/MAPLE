@@ -17,6 +17,12 @@ from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import sapien_utils
 from mani_skill.utils.registration import register_env
 
+ROBOT_POSE_LEFT = sapien.Pose(p=[0, -0.9, 0], q=[-0.7071068, 0, 0, -0.7071068])
+ROBOT_POSE_RIGHT = sapien.Pose(p=[0, 0.9, 0], q=[0.7071068, 0, 0, -0.7071068])
+BASE_CAMERA_POSE = sapien_utils.look_at(eye=[1.0, 0, 0.75], target=[0.0, 0.0, 0.25])
+RENDER_CAMERA_POSE = sapien_utils.look_at(eye=[1.4, 0.8, 0.75], target=[0.0, 0.1, 0.1])
+BASE_CAMERA_CONFIG = CameraConfig("base_camera", BASE_CAMERA_POSE, 128, 128, np.pi / 2, 0.01, 100)
+RENDER_CAMERA_CONFIG = CameraConfig("render_camera", RENDER_CAMERA_POSE, 512, 512, 1, 0.01, 100)
 
 @register_env("PickCube-SideView-v1", max_episode_steps=100)
 class PickCubeSideViewEnv(PickCubeEnv):
@@ -28,19 +34,13 @@ class PickCubeSideViewEnv(PickCubeEnv):
     @property
     def _default_sensor_configs(self):
         # Side view camera - pulled back to see where second robot would be
-        pose = sapien_utils.look_at(
-            eye=[1.0, 0, 0.75],      # Same as TwoRobotPickCube
-            target=[0.0, 0.0, 0.25]
-        )
-        return [CameraConfig("base_camera", pose, 128, 128, np.pi / 2, 0.01, 100)]
+        pose = BASE_CAMERA_POSE
+        return [BASE_CAMERA_CONFIG]
 
     @property
     def _default_human_render_camera_configs(self):
-        pose = sapien_utils.look_at(
-            eye=[1.4, 0.8, 0.75],
-            target=[0.0, 0.1, 0.1]
-        )
-        return CameraConfig("render_camera", pose, 512, 512, 1, 0.01, 100)
+        pose = RENDER_CAMERA_POSE
+        return RENDER_CAMERA_CONFIG
 
 
 @register_env("PickCube-SideView-TwoRobot-v1", max_episode_steps=100)
@@ -59,16 +59,16 @@ class PickCubeSideViewTwoRobotEnv(PickCubeSideViewEnv):
     def _load_agent(self, options: dict):
         BaseEnv._load_agent(
             self, options,
-            [sapien.Pose(p=[-0.615, 0, 0]),   # robot 0: same as PickCubeEnv
-             sapien.Pose(p=[0, 0.9, 0], q=[0.7071068, 0, 0, -0.7071068])]  # robot 1: behind table, facing -Y
+            [ROBOT_POSE_LEFT,   # robot 0: same as PickCubeEnv
+             ROBOT_POSE_RIGHT]  # robot 1: behind table, facing -Y
         )
 
     def _initialize_episode(self, env_idx, options):
         super()._initialize_episode(env_idx, options)
         # TableSceneBuilder overrides ("panda","panda") robot 0 to [0,-0.75,0]+90°.
         # Restore to training-compatible pose.
-        self.agent.agents[0].robot.set_pose(sapien.Pose(p=[-0.615, 0, 0]))
-        self.agent.agents[1].robot.set_pose(sapien.Pose(p=[0, 0.9, 0], q=[0.7071068, 0, 0, -0.7071068]))
+        self.agent.agents[0].robot.set_pose(ROBOT_POSE_LEFT)
+        self.agent.agents[1].robot.set_pose(ROBOT_POSE_RIGHT)
 
     def evaluate(self):
         agent0 = self.agent.agents[0]
@@ -116,3 +116,35 @@ class PickCubeSideViewTwoRobotEnv(PickCubeSideViewEnv):
 
     def compute_normalized_dense_reward(self, obs, action, info):
         return self.compute_dense_reward(obs=obs, action=action, info=info) / 5
+    
+
+# Test environment with robot on the side
+@register_env("PickCube-SideView-Right-v1", max_episode_steps=100)
+class PickCubeSideViewEnvRight(PickCubeSideViewEnv):
+    """
+    PickCube with side-view camera for multi-robot compatibility.
+    Inherits everything from PickCubeEnv, only changes camera.
+    """
+
+    def _load_agent(self, options: dict):
+        BaseEnv._load_agent(self, options, ROBOT_POSE_RIGHT)
+
+    def _initialize_episode(self, env_idx, options):
+        super()._initialize_episode(env_idx, options)
+        # TableSceneBuilder resets the robot pose — restore it
+        self.agent.robot.set_pose(ROBOT_POSE_RIGHT)
+
+@register_env("PickCube-SideView-Left-v1", max_episode_steps=100)
+class PickCubeSideViewEnvLeft(PickCubeSideViewEnv):
+    """
+    PickCube with side-view camera for multi-robot compatibility.
+    Inherits everything from PickCubeEnv, only changes camera.
+    """
+
+    def _load_agent(self, options: dict):
+        BaseEnv._load_agent(self, options, ROBOT_POSE_LEFT)
+
+    def _initialize_episode(self, env_idx, options):
+        super()._initialize_episode(env_idx, options)
+        # TableSceneBuilder resets the robot pose — restore it
+        self.agent.robot.set_pose(ROBOT_POSE_LEFT)

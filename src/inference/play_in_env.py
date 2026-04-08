@@ -5,16 +5,23 @@ import mani_skill.envs
 from src.envs.two_robot_pick_cube import TwoRobotTwoCubePickCube
 from src.envs.one_robot_pick_cube import OneRobotPickCube
 from src.envs.pick_cube_side import PickCubeSideViewEnv
+from src.envs.two_robot_pick_cube_custom_cam import HorizontalDualArmLeftOnlyEnv
 
 
 env = gym.make(
-    # "TwoRobotTwoCubePickCube-v1", # there are more tasks e.g. "PushCube-v1", "PegInsertionSide-v1", ...
+    # "HorizontalDualArm-v1",
+    # "HorizontalDualArm-LeftOnly-v1",
+    # "HorizontalDualArm-RightOnly-v1",
+    # "TwoRobotPickCubeCustomCam-v1",
+    # "TwoRobotTwoCubePickCube-v1",
     # "OneRobotPickCube-v1",
-    # "PickCube-v1",
-    "PickCube-SideView-v1",
+    # "PickCube-SideView-v1",
+    # "PickCube-SideView-TwoRobot-v1",
+    # "PickCube-SideView-Left-v1",
+    "PickCube-SideView-Right-v1",
     num_envs=1,
-    obs_mode="rgbd", # there is also "state_dict", "rgbd", ...
-    control_mode="pd_ee_delta_pose", # there is also "pd_joint_delta_pos", ...
+    obs_mode="rgb",
+    control_mode="pd_joint_delta_pos",
     render_mode="human"
 )
 print("Observation space", env.observation_space)

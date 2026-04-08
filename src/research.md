@@ -19,15 +19,21 @@
 - ~~Investigate (rgbd vs rgb seems to be weird) **Running experiments, inital thoughts seem like rgb traj file has something that is better than rgbd. Should play it back**~~
 - ~~Generate ee_delta trajectories with side_view observations **Working on it**~~
 - ~~Use it to train a robust baseline policy with side_view **Put on training**~~
-- Load that policy in the environment and perform inference for a sample inside its training data to see how good the output is
+- ~~Load that policy in the environment and perform inference for a sample inside its training data to see how good the output is~~
     - Load the environment to be PickCube-SideView-v1 using gym.make
     - Get the observations from the camera and the 29 vector state that you need to give to the policy
     - Maintain an observation buffer and load that 
     - Generate a noise vector of the pred_horizon * R^n where n depends on the control strategy
     - Iterate over execution horizon and load the actions and take steps through the environment (remember to update observation buffer)
     - Loop until max_steps reached (200 or something?)
-- Once this is done, load the same view and episode but with another (static) agent in the scene. Observe any changes in behaviour and record videos
+- ~~Once this is done, load the same view and episode but with another (static) agent in the scene. Observe any changes in behaviour and record videos~~
 - Now have the policy predict outputs for both agents in the scene and observe
+
+- Generated ```PickCubeSideViewEnv, PickCubeSideViewTwoRobotEnv, PickCubeSideViewEnvRight, PickCubeSideViewEnvLeft``` for new camera position, side by side robots, robot only on right, and robot only on left respectively
+- Now I must generate the relevant trajectories using the replay tool from Maniskill to ensure it is RGB and ee_delta_pos
+- Play the trajectories back to make sure they make sense
+- Put both policies to train (left and right)
+
 
 ## Long Term Goals
 - Make a trajectory class so you don't need so many util scripts
