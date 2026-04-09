@@ -204,7 +204,7 @@ class Trainer:
 
         obs_traj_dict = trajectories["observations"][0]
         print("BEFORE reorder_keys:", obs_traj_dict.keys())
-
+        
         _obs_traj_dict = reorder_keys(obs_traj_dict, orignal_obs_space)
         print("AFTER reorder_keys:", _obs_traj_dict.keys())
 

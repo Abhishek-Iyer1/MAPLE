@@ -256,7 +256,17 @@ def _setup_env_state(env, cube_pos_new, cube_q_new, goal_pos_new, goal_q_new, qp
     # Sync all controller targets to restored qpos (bypasses _reset_mask guard)
     _sync_controller_targets(env)
 
-
+def clone_obs_dict(d):
+    """Recursively clone PyTorch tensors and numpy arrays to break memory references."""
+    if isinstance(d, dict):
+        return {k: clone_obs_dict(v) for k, v in d.items()}
+    elif isinstance(d, torch.Tensor):
+        return d.clone().detach() # Copies the tensor memory safely
+    elif isinstance(d, np.ndarray):
+        return d.copy()
+    else:
+        return d
+    
 def transform_and_replay(
     source_path: str,
     target_env: str,
@@ -442,7 +452,7 @@ def transform_and_replay(
                 obs, reward, terminated, truncated, info = env.step(action_t)
 
                 env_state_list.append(env.unwrapped.get_state_dict())
-                obs_list.append(obs)
+                obs_list.append(clone_obs_dict(obs))
                 action_list.append(saved_action)
                 reward_list.append(float(reward.cpu().item() if isinstance(reward, torch.Tensor) else reward))
                 terminated_list.append(bool(terminated.cpu().item() if isinstance(terminated, torch.Tensor) else terminated))

@@ -18,7 +18,7 @@ env = gym.make(
     # "PickCube-SideView-v1",
     # "PickCube-SideView-TwoRobot-v1",
     # "PickCube-SideView-Left-v1",
-    "PickCube-SideView-Right-v1",
+    # "PickCube-SideView-Right-v1",
     num_envs=1,
     obs_mode="rgb",
     control_mode="pd_joint_delta_pos",
