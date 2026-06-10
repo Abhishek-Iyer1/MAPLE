@@ -137,7 +137,20 @@ class Agent(nn.Module):
 
         return F.mse_loss(noise_pred, noise)
 
-    def get_action(self, obs_seq):
+    def get_action(self, obs_seq, guidance_fn=None, guidance_scale: float = 1.0):
+        """
+        Run diffusion inference, optionally with classifier guidance.
+
+        Args:
+            obs_seq:        observation dict with 'rgb'/'depth'/'state' tensors.
+            guidance_fn:    Optional callable (noisy_action_seq) -> scalar cost tensor.
+                            Receives the current noisy actions (B, pred_horizon, act_dim)
+                            in normalised [-1, 1] space at each denoising step.
+                            The caller is responsible for any FK / coordinate conversion
+                            before computing the cost.
+            guidance_scale: Weight applied to the cost gradient before subtracting
+                            it from the noise prediction.
+        """
         B = obs_seq["state"].shape[0]
         with torch.no_grad():
             if self.include_rgb:
@@ -159,6 +172,18 @@ class Agent(nn.Module):
                     timestep=k,
                     global_cond=obs_cond,
                 )
+
+                # classifier guidance: add ∇_{x_t} cost to the noise prediction.
+                # Sign reasoning: x_{t-1} ∝ x_t - α·noise_pred, so increasing
+                # noise_pred in direction d moves x in direction -d.  The cost
+                # gradient points toward the sphere centre, so adding it to
+                # noise_pred moves x away from centre (repulsion).
+                if guidance_fn is not None:
+                    with torch.enable_grad():
+                        noisy_copy = noisy_action_seq.detach().requires_grad_(True)
+                        cost = guidance_fn(noisy_copy)
+                        grad = torch.autograd.grad(cost, noisy_copy)[0]
+                    noise_pred = noise_pred + guidance_scale * grad
 
                 # inverse diffusion step (remove noise)
                 noisy_action_seq = self.noise_scheduler.step(

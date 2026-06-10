@@ -19,8 +19,8 @@ from mani_skill.utils.building import actors
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.structs.pose import Pose
 
-ROBOT_POSE_LEFT = sapien.Pose(p=[0, -0.7, 0], q=[-0.7071068, 0, 0, -0.7071068])
-ROBOT_POSE_RIGHT = sapien.Pose(p=[0, 0.7, 0], q=[0.7071068, 0, 0, -0.7071068])
+ROBOT_POSE_LEFT = sapien.Pose(p=[0, -0.9, 0], q=[-0.7071068, 0, 0, -0.7071068])
+ROBOT_POSE_RIGHT = sapien.Pose(p=[0, 0.9, 0], q=[0.7071068, 0, 0, -0.7071068])
 BASE_CAMERA_POSE = sapien_utils.look_at(eye=[1.0, 0, 0.75], target=[0.0, 0.0, 0.25])
 RENDER_CAMERA_POSE = sapien_utils.look_at(eye=[1.4, 0.8, 0.75], target=[0.0, 0.1, 0.1])
 BASE_CAMERA_CONFIG = CameraConfig("base_camera", BASE_CAMERA_POSE, 128, 128, np.pi / 2, 0.01, 100)
@@ -33,6 +33,10 @@ class PickCubeSideViewEnv(PickCubeEnv):
     Inherits everything from PickCubeEnv, only changes camera.
     """
 
+    def __init__(self, *args, cost_sphere_radius: float = 0.05, **kwargs):
+        self._cost_sphere_radius = cost_sphere_radius
+        super().__init__(*args, **kwargs)
+
     @property
     def _default_sensor_configs(self):
         # Side view camera - pulled back to see where second robot would be
@@ -43,6 +47,22 @@ class PickCubeSideViewEnv(PickCubeEnv):
     def _default_human_render_camera_configs(self):
         pose = RENDER_CAMERA_POSE
         return RENDER_CAMERA_CONFIG
+
+    def _load_scene(self, options: dict):
+        super()._load_scene(options)
+        # Cost/obstacle sphere — added to _hidden_objects so it is invisible to
+        # sensor/observation cameras (base_camera) but still visible in the
+        # render camera, exactly like the goal sphere.
+        self.cost_sphere = actors.build_sphere(
+            self.scene,
+            radius=self._cost_sphere_radius,
+            color=[1, 0, 0, 0.4],
+            name="cost_sphere",
+            body_type="kinematic",
+            add_collision=False,
+            initial_pose=sapien.Pose(p=[0, 0, -10]),
+        )
+        self._hidden_objects.append(self.cost_sphere)
 
 
 @register_env("PickCube-SideView-TwoRobot-v1", max_episode_steps=100)

@@ -17,17 +17,22 @@ Usage:
 
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional
+import random
 
 import gymnasium as gym
+import imageio
 import numpy as np
 import torch
 import tyro
 from gymnasium import spaces
 from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper
+from mani_skill.utils.wrappers.record import RecordEpisode
 
 from src.agent import Agent
 from src.args import Args
+from src.inference.guidance import obstacle_cost, integrate_ee_deltas, _TCP_XYZ_SLICE
 
 LEFT_TRAIN_POSES = [
     {"cube_p": [-0.0536, -0.2857, 0.02], "cube_q": [-0.1794, 0, 0, 0.9838], "goal_p": [0.002,   -0.2582, 0.2889]},
@@ -44,12 +49,13 @@ LEFT_TRAIN_POSES = [
 from src.envs.pick_cube_side import PickCubeSideViewEnv  # noqa — registers all SideView envs
 from src.envs.pick_cube_side import PickCubeSideViewDualTaskEnv  # noqa
 from src.envs.wrappers import SingleRobotInferenceWrapper
+from mani_skill.utils.structs.pose import Pose
 
 
 @dataclass
 class InferenceArgs:
     checkpoint_path: str = "checkpoints/best_eval_success_at_end.pt"
-    env_id: str = "PickCube-SideView-v1"
+    env_id: str = "PickCube-SideView-Left-v1"
     num_episodes: int = 5
     max_episode_steps: int = 100
     obs_horizon: int = 2
@@ -60,6 +66,11 @@ class InferenceArgs:
     device: str = "cuda"
     render: bool = True
     use_train_poses: bool = False
+    # Reproducibility
+    seed: int = 42
+    # Video recording — wraps env with RecordEpisode; disables live render window
+    record_video: bool = False
+    video_dir: str = "videos/inference"
     # Dual-policy mode: set --dual and provide --right_checkpoint
     dual: bool = False
     right_checkpoint: str = "checkpoints/right/best_eval_success_at_end.pt"
@@ -67,6 +78,12 @@ class InferenceArgs:
     diffusion_step_embed_dim: int = 64
     unet_dims: List[int] = field(default_factory=lambda: [64, 128, 256])
     n_groups: int = 8
+    # Guidance — sphere obstacle cost applied at every denoising step
+    use_guidance: bool = False
+    guidance_center: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.5])
+    guidance_radius: float = 0.1
+    guidance_scale: float = 1.0
+    track_goal: bool = False  # if True, place sphere at the goal site each episode
 
 
 class _FakeEnv:
@@ -88,6 +105,14 @@ class _FakeEnv:
             ),
         }
         self.single_observation_space = spaces.Dict(sd)
+
+
+def _set_seed(seed: int):
+    """Seed all RNGs for reproducible inference."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 # ── Dual-policy helpers ───────────────────────────────────────────────────────
@@ -147,16 +172,21 @@ def _load_dual_agent(ckpt_path: str, fake_env: _DualFakeEnv, args: "InferenceArg
 
 
 def dual_main(args: "InferenceArgs"):
+    _set_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
+    render_mode = "rgb_array" if args.record_video else ("human" if args.render else "rgb_array")
     env = gym.make(
         "PickCube-SideView-DualTask-v1",
         num_envs=1,
         obs_mode="rgb",
         control_mode=args.control_mode,
-        render_mode="human" if args.render else "rgb_array",
+        render_mode=render_mode,
         max_episode_steps=args.max_episode_steps,
+        cost_sphere_radius=args.guidance_radius,
     )
+    if args.record_video:
+        env = RecordEpisode(env, output_dir=args.video_dir, save_trajectory=False, save_video=True, save_on_reset=True, video_fps=20)
 
     r0_space = env.single_action_space["panda-0"]
     r1_space = env.single_action_space["panda-1"]
@@ -164,17 +194,74 @@ def dual_main(args: "InferenceArgs"):
     agent_left  = _load_dual_agent(args.checkpoint_path,  _DualFakeEnv(args.obs_horizon, r0_space), args, device)
     agent_right = _load_dual_agent(args.right_checkpoint, _DualFakeEnv(args.obs_horizon, r1_space), args, device)
 
+    # Build per-robot guidance closures if requested.
+    # Each closure:
+    #   1. Reads the latest TCP xyz from the robot's obs buffer (updated before get_action).
+    #   2. Calls integrate_ee_deltas to convert normalised action deltas → absolute xyz.
+    #   3. Evaluates obstacle_cost against the shared sphere centre/radius.
+    # tcp_left/tcp_right are mutable single-element lists so the closures always see
+    # the value written just before get_action() is called each chunk.
+    guidance_fn_left = guidance_fn_right = None
+    tcp_left_cell  = [None]   # torch.Tensor (3,), updated each chunk
+    tcp_right_cell = [None]
+
+    if args.use_guidance:
+        center  = torch.tensor(args.guidance_center, dtype=torch.float32, device=device)
+        _radius = args.guidance_radius
+
+        def guidance_fn_left(norm_actions):
+            positions = integrate_ee_deltas(norm_actions, tcp_left_cell[0], agent_left)
+            return obstacle_cost(positions, center, _radius)
+
+        def guidance_fn_right(norm_actions):
+            positions = integrate_ee_deltas(norm_actions, tcp_right_cell[0], agent_right)
+            return obstacle_cost(positions, center, _radius)
+
+        print(f"Guidance enabled: center={args.guidance_center}, radius={_radius}, scale={args.guidance_scale}")
+
+    # Unwrapped env for direct actor access (cost sphere repositioning)
+    raw_env = env.unwrapped
+
+    def _sphere_pose(xyz):
+        """xyz: list[float] or 1-D torch.Tensor"""
+        if isinstance(xyz, torch.Tensor):
+            p = xyz.detach().float().to(device).unsqueeze(0)
+        else:
+            p = torch.tensor([xyz], dtype=torch.float32, device=device)
+        return Pose.create_from_pq(p=p, q=torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device))
+
     successes = []
 
     for ep in range(args.num_episodes):
-        obs, _ = env.reset()
+        ep_seed = args.seed + ep
+        _set_seed(ep_seed)
+        obs, _ = env.reset(seed=[ep_seed])
         buf_left  = deque([_extract_robot_obs(obs, 0)] * args.obs_horizon, maxlen=args.obs_horizon)
         buf_right = deque([_extract_robot_obs(obs, 1)] * args.obs_horizon, maxlen=args.obs_horizon)
 
         step, done, info = 0, False, {}
         while step < args.max_episode_steps and not done:
-            act_left  = agent_left.get_action(_stack_buf(buf_left,  device))  # (1,act_h,4)
-            act_right = agent_right.get_action(_stack_buf(buf_right, device)) # (1,act_h,4)
+            # Refresh TCP positions from latest obs before running the denoising loop.
+            # state layout: qpos(9)|qvel(9)|is_grasped(1)|tcp_pose(7)|goal_pos(3)
+            # _TCP_XYZ_SLICE = slice(19, 22) extracts the xyz part of tcp_pose.
+            if args.use_guidance:
+                tcp_left_cell[0]  = torch.from_numpy(
+                    buf_left[-1]["state"][_TCP_XYZ_SLICE]
+                ).float().to(device)
+                tcp_right_cell[0] = torch.from_numpy(
+                    buf_right[-1]["state"][_TCP_XYZ_SLICE]
+                ).float().to(device)
+
+            act_left  = agent_left.get_action(
+                _stack_buf(buf_left,  device),
+                guidance_fn=guidance_fn_left,
+                guidance_scale=args.guidance_scale,
+            )
+            act_right = agent_right.get_action(
+                _stack_buf(buf_right, device),
+                guidance_fn=guidance_fn_right,
+                guidance_scale=args.guidance_scale,
+            )
 
             for i in range(args.act_horizon):
                 obs, _rew, terminated, truncated, info = env.step({
@@ -187,7 +274,13 @@ def dual_main(args: "InferenceArgs"):
                 if terminated.any() or truncated.any() or step >= args.max_episode_steps:
                     done = True
                     break
-            env.render()
+
+            # cost_sphere is in _hidden_objects so it never appears in base_camera obs;
+            # just keep its world position up to date for the render camera.
+            if args.use_guidance:
+                raw_env.cost_sphere.set_pose(_sphere_pose(args.guidance_center))
+            if not args.record_video:
+                env.render()
 
         success      = bool(info.get("success",        np.array([False]))[0])
         left_placed  = bool(info.get("is_obj_placed_0", np.array([False]))[0])
@@ -198,27 +291,36 @@ def dual_main(args: "InferenceArgs"):
             f"left_placed={left_placed}, right_placed={right_placed}, success={success}"
         )
 
+    if args.record_video:
+        env.flush_video()
     env.close()
     rate = sum(successes) / len(successes) if successes else 0.0
     print(f"\nSuccess rate: {sum(successes)}/{len(successes)} = {rate:.1%}")
+    if args.record_video:
+        print(f"Videos saved to: {Path(args.video_dir).resolve()}")
 
 
 # ── Single-policy main ────────────────────────────────────────────────────────
 
 def main(args: "InferenceArgs"):
+    _set_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
+    render_mode = "rgb_array" if args.record_video else ("human" if args.render else "rgb_array")
     env = gym.make(
         args.env_id,
         num_envs=1,
         obs_mode=args.obs_mode,
         control_mode=args.control_mode,
-        render_mode="human" if args.render else "rgb_array",
+        render_mode=render_mode,
         max_episode_steps=args.max_episode_steps,
+        cost_sphere_radius=args.guidance_radius,
     )
     if isinstance(env.single_action_space, gym.spaces.Dict):
         env = SingleRobotInferenceWrapper(env)
     env = FlattenRGBDObservationWrapper(env)
+    if args.record_video:
+        env = RecordEpisode(env, output_dir=args.video_dir, save_trajectory=False, save_video=True, save_on_reset=True, video_fps=20)
 
     fake_env = _FakeEnv(env, args.obs_horizon)
     agent = Agent(fake_env, args).to(device)
@@ -228,11 +330,51 @@ def main(args: "InferenceArgs"):
     agent.eval()
     print(f"Loaded checkpoint: {args.checkpoint_path}")
 
+    # Build guidance closure for single-robot mode.
+    # tcp_cell / center_cell are mutable single-element lists so the closure
+    # always sees the values written just before get_action() is called.
+    # State layout: qpos(9)|qvel(9)|is_grasped(1)|tcp_pose_xyzquat(7)|goal_pos(3)
+    # → tcp xyz lives at obs["state"][0, 19:22]  (same _TCP_XYZ_SLICE as dual mode)
+    tcp_cell    = [None]
+    center_cell = [torch.tensor(args.guidance_center, dtype=torch.float32, device=device)]
+    guidance_fn = None
+    if args.use_guidance:
+        _radius = args.guidance_radius
+
+        def guidance_fn(norm_actions):
+            positions = integrate_ee_deltas(norm_actions, tcp_cell[0], agent)
+            return obstacle_cost(positions, center_cell[0], _radius)
+
+        mode = "goal site" if args.track_goal else f"fixed {args.guidance_center}"
+        print(f"Guidance enabled: center={mode}, radius={_radius}, scale={args.guidance_scale}")
+
+    raw_env = env.unwrapped
+
+    def _sphere_pose(xyz):
+        """xyz: list[float] or 1-D torch.Tensor"""
+        if isinstance(xyz, torch.Tensor):
+            p = xyz.detach().float().to(device).unsqueeze(0)
+        else:
+            p = torch.tensor([xyz], dtype=torch.float32, device=device)
+        return Pose.create_from_pq(p=p, q=torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device))
+
     successes = []
 
     for ep in range(args.num_episodes):
+        ep_seed = args.seed + ep
+        _set_seed(ep_seed)
         pose_options = LEFT_TRAIN_POSES[ep % len(LEFT_TRAIN_POSES)] if args.use_train_poses else {}
-        obs, _ = env.reset(options=pose_options)
+        obs, _ = env.reset(seed=[ep_seed], options=pose_options)
+        # Update guidance center and sphere position after reset.
+        if args.use_guidance:
+            if args.track_goal:
+                # Place sphere at the goal site position (randomised per episode).
+                goal_p = raw_env.goal_site.pose.p
+                if isinstance(goal_p, torch.Tensor):
+                    center_cell[0] = goal_p[0].float().to(device)
+                else:
+                    center_cell[0] = torch.tensor(goal_p[0], dtype=torch.float32, device=device)
+            raw_env.cost_sphere.set_pose(_sphere_pose(center_cell[0]))
         obs_buf = deque([obs] * args.obs_horizon, maxlen=args.obs_horizon)
 
         step = 0
@@ -247,6 +389,11 @@ def main(args: "InferenceArgs"):
                     return x.to(device)
                 return torch.from_numpy(np.asarray(x)).to(device)
 
+            # Refresh TCP xyz from latest obs before running the denoising loop
+            if args.use_guidance:
+                raw_state = obs_buf[-1]["state"]   # (1, state_dim) tensor or numpy
+                tcp_cell[0] = to_t(raw_state)[0, _TCP_XYZ_SLICE].float()
+
             stacked = {
                 "rgb": torch.stack([to_t(o["rgb"]) for o in obs_buf], dim=1),
                 # (1, obs_horizon, H, W, C) uint8
@@ -255,7 +402,11 @@ def main(args: "InferenceArgs"):
             }
 
             # Diffusion inference → (1, act_horizon, act_dim)
-            action_seq = agent.get_action(stacked)
+            action_seq = agent.get_action(
+                stacked,
+                guidance_fn=guidance_fn,
+                guidance_scale=args.guidance_scale,
+            )
             action_np = action_seq.cpu().numpy()  # (1, act_horizon, act_dim)
 
             # Execute action chunk step-by-step
@@ -266,16 +417,22 @@ def main(args: "InferenceArgs"):
                 if terminated.any() or truncated.any() or step >= args.max_episode_steps:
                     done = True
                     break
-            env.render()
+
+            if not args.record_video:
+                env.render()
 
         success = bool(info.get("success", np.array([False]))[0])
         successes.append(success)
         print(f"Episode {ep + 1}/{args.num_episodes}: steps={step}, success={success}")
 
+    if args.record_video:
+        env.flush_video()  # flush the final episode (save_on_reset only fires on reset, not close)
     env.close()
 
     rate = sum(successes) / len(successes) if successes else 0.0
     print(f"\nSuccess rate: {sum(successes)}/{len(successes)} = {rate:.1%}")
+    if args.record_video:
+        print(f"Videos saved to: {Path(args.video_dir).resolve()}")
 
 
 if __name__ == "__main__":
